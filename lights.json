@@ -1,0 +1,32 @@
+{
+  "lights": [
+    {
+      "id": "2",
+      "name": "Kitchen Front Right",
+    },
+    {
+      "id": "3",
+      "name": "Kitchen Front Left",
+    },
+    {
+      "id": "4",
+      "name": "Living Room Bottom",
+    },
+    {
+      "id": "5",
+      "name": "Kitchen Rear",
+    },
+    {
+      "id": "6",
+      "name": "Living Room top",
+    },
+    {
+      "id": "7",
+      "name": "Rikis Room",
+    },
+    {
+      "id": "8",
+      "name": "LightStrips",
+    }
+  ]
+}

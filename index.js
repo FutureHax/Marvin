@@ -1,176 +1,132 @@
 var config = require('./config');
-var express = require('express');
-var app = express();
 var fs = require('fs');
-var bodyParser = require('body-parser');
-var moment = require('moment');
-var util = require('util');
-var tz = require('moment-timezone');
+exports.fs = fs;
 
-var gcm = require('node-gcm');
-var sender = new gcm.Sender(config.gcm_sender);
+var marvin_utils = require('./marvin_utils.js');
+var util = marvin_utils.util;
 
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
-app.set('superSecret', config.secret); 
-
-var EXIT_GRACE_PERIOD = 30000; // milliseconds
+var watch = require('watch')
+var exec = require('child_process').exec;
 
 var sqlite3 = require('sqlite3').verbose();
 var db = new sqlite3.Database(':users:');
-var loggedIn = false;
 
-var hue = require("node-hue-api"),
-    HueApi = hue.HueApi,
-    lightState = hue.lightState;
-
-var host = "192.168.1.136",
-    username = config.hue_user,
-    api = new HueApi(host, username);
-
-var onState = lightState.create().turnOn();
-var offState = lightState.create().turnOff();
-var lightsArray = { };
+var hue_controller = require('./hue_controller.js');
+var hue_controller_instance;
+var roomMap = {};
 
 var bleno = require('bleno');
+var bleno_controller = require('./bluetooth_controller.js');
 
-var BlenoPrimaryService = bleno.PrimaryService;
-var IpCharacteristic = require('./ip_characteristic');
+var gcm_controller = require('./gcm_controller.js');
+var express_controller = require('./express_controller.js');
+
+var nest_controller = require('./nest_controller.js');
+
+var awayCount = 0;
+
+var ADMIN_ID = '101541075248187016246';
+
+var domain = require('domain');
+var d = domain.create();
+d.on('error', function(err) {
+  marvin_utils.error(err.stack +  " : " + err);
+});
 
 bleno.on('stateChange', function(state) {
-  if (state === 'poweredOn') {
-    var uuid = 'FD5B667C-73C8-11E5-8BCF-FEFF819CDC9F'
-    var major = 420;
-    var minor = 710;
-    var mtx = 0;
-
-    log('About to start advertising....');
-    bleno.startAdvertisingIBeacon(uuid, major, minor, mtx);
-  }
+  bleno_controller.on(state);
 });
 
 bleno.on('advertisingStart', function(error) {
-  log('on -> advertisingStart: ' + (error ? 'error ' + error : 'success'));
-
-  if (!error) {
-    bleno.setServices([
-      new BlenoPrimaryService({
-        uuid: '01010101010101010101010101010101',
-        characteristics: [
-          new IpCharacteristic()
-        ]
-      })
-    ]);
-  }
-});
-
-function lightsOn() {
-  for (var i in lightsArray) {
-    if (lightsArray[i].name
-	.indexOf('Living') > -1 ||
-        lightsArray[i].name 
-        .indexOf('Kitchen') > -1) {
-      setLightState(lightsArray[i].id, onState);
-    }
-  }
-}
-
-function lightsOff() {
-  for (var i in lightsArray) {
-    setLightState(lightsArray[i].id, offState);
-
-  }
-}
-
-var failedCalls = {}
-function setLightState(id, state) {
-  api.setLightState(id, state, function(err, lights) {
-    if (err) {
-      log(err + " setting light " + id + ", will retry");
-      failedCalls[id] = state;
-    } else {
-      log("set " + id + " -> " + state._values.on);
-    }
-  });
-}
-
-
-nest = require('unofficial-nest-api');
-nest.login(config.nest_user, config.nest_pass, function (err, data) {
-    if (err) {
-        log(err.message);
-        return;
-    } else {
-      loggedIn = true;
-    }
+  bleno_controller.on('advertisingStart');
 });
 
 db.serialize(function() {
-  db.run('CREATE TABLE IF NOT EXISTS users (name TEXT NOT NULL, mac TEXT NOT NULL UNIQUE, status TEXT NOT NULL, room TEXT NOT NULL, lastBeat NUMBER, gcm_id TEXT NOT NULL)');
-  fetchBulbs();
-  dumpData();
-  db.all('SELECT * FROM users', function(err, usersAll) {
+ //clear rooms
+ //db.run('DROP TABLE IF EXISTS rooms');
+
+ sendAdminMessage('Marvin is waking up');
+ db.run('CREATE TABLE IF NOT EXISTS users (profile_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL, email TEXT NOT NULL, status TEXT NOT NULL, room TEXT NOT NULL, lastBeat NUMBER, gcm_id TEXT NOT NULL)');
+ db.run('CREATE TABLE IF NOT EXISTS devices (id TEXT NOT NULL UNIQUE, name TEXT NOT NULL, type TEXT NOT NULL)');
+ db.run('CREATE TABLE IF NOT EXISTS rooms (room_name TEXT NOT NULL UNIQUE, mac_list TEXT NOT NULL, device_ids TEXT NOT NULL)');
+
+ nest_controller.logIn();
+ hue_controller_instance = new hue_controller(db);
+ express_controller_instance = new express_controller(db, hue_controller_instance);
+ startWatch();
+ 
+ db.all('SELECT * FROM users', function(err, usersAll) {
     usersAll.forEach(function(user) {
-      requestHeartBeatForUser(user.mac);
+      requestHeartBeatForUser(user.profile_id);
+    });
+  });
+
+  db.all('SELECT * FROM rooms', function(err, rooms) {
+    rooms.forEach(function(room) {
+      marvin_utils.inspect(room);
     });
   });
 });
 
-function fetchBulbs() {
-  api.lights(function(err, lights) {
-    if (err) throw err;
-    for (var i in lights.lights) {
-      var id = lights.lights[i].id;
-      if (lights.lights[i].name.toString() != 'LightStrips') {
-        lightsArray[id] = lights.lights[i];
-      }
+function handleSomebodyHome(structure) {
+  awayCount = 0;
+  if (structure.away) {
+    sendMessageToAllUsers("Setting " + structure.name + " to home");
+    marvin_utils.log("Setting " + structure.name + " to home");
+    nest_controller.setAway(false);
+    hue_controller_instance.allOn();
+  }
+}
+
+function handleNobodyHome(structure) {
+  if (!structure.away) {
+    if (awayCount > 5) {
+      sendMessageToAllUsers("Setting " + structure.name + " to away");
+      marvin_utils.log("Setting " + structure.name + " to away");
+      nest_controller.setAway(true);
+      hue_controller_instance.allOff();
+    } else {
+      awayCount++;
+      marvin_utils.log("Away for " + awayCount + " cycles.")
     }
-  });
+  }
 }
 
 function dumpData() {
-  if (!loggedIn) {
-    log('Not logged into Nest');
+  if (!nest_controller.loggedIn) {
+    marvin_utils.log('Not yet logged into Nest');
     return;
   }
 
-  nest.fetchStatus(function (data) {
+  nest_controller.fetchStatus(function (data) {
     var now = new Date().getTime();
     for (var id in data.structure) {
       if (data.structure.hasOwnProperty(id)) {
         var structure = data.structure[id];
 
-        db.all('SELECT mac FROM users WHERE status="true"', function(err, usersHome) {
+        db.all('SELECT profile_id FROM users WHERE status="true"', function(err, usersHome) {
           db.all('SELECT * FROM users', function(err, usersAll) {
-            log(structure.name + " is currently " + (structure.away ? "away" : "home"));
+            marvin_utils.log(structure.name + " is currently " + (structure.away ? "away" : "home"));
             if (usersAll.length > 0) {
               if (usersHome.length == 0) {
-                log("Nobody is home");
-   	        if (!structure.away) {
-		  sendMessageToAllUsers("Setting " + structure.name + " to away");
-                  log("Setting " + structure.name + " to away");
-		  nest.setAway(true);
-                  lightsOff();
-                }
+		handleNobodyHome(structure);
               } else {
-                log("Somebody is home");
+		handleSomebodyHome(structure);
+                marvin_utils.log("Somebody is home");
       	        if (structure.away) {
                   sendMessageToAllUsers("Setting " + structure.name + " to home");
-		  log("Setting " + structure.name + " to home");
-                  nest.setAway(false);
-	          lightsOn();
+		  marvin_utils.log("Setting " + structure.name + " to home");
+                  nest_controller.setAway(false);
+	          hue_controller_instance.allOn();
                 }
               }
             }
-             usersAll.forEach(function (user) {
+            usersAll.forEach(function (user) {
               var time = now - user.lastBeat;
-	      if (time > 60000 * 5) {
-                log("havent seen " + user.name + " in " + time);
-	        addItem(user.name, user.mac, false, user.room, user.gcm_id);
-	      }
-
-              if (time > 60000 * 15) {
-                requestHeartBeatForUser(user.mac);
+              marvin_utils.log("Checking  " + user.name + " = " + time);
+              if (time > 1000 * 60 * 15) {
+                marvin_utils.log("Requesting heartbeat from " + user.name);
+                requestHeartBeatForUser(user.profile_id);
               }
             })
           })
@@ -180,223 +136,166 @@ function dumpData() {
   });
 }
 
-app.get('/log/:length', function(req, res) {
-  var token = req.body.token || req.query.token || req.headers['x-access-token'];
-  if (token) {
-    if (token = config.secret) {
-      send_lines('/var/log/bluetooth_server.log', req.params.length, res);
-    } else { 
-      res.status(403).send({
-        success: false,
-        message: 'No token provided.'
-      });
-    }
-  } else {
-    res.status(403).send({ 
-        success: false, 
-        message: 'No token provided.' 
-    });
-  }
-});
+exports.sendAdminMessage = function adminMessage(msg) {
+  sendAdminMessage(msg);
+}
 
-app.get('/check/:mac', function (req, res) {
-  var token = req.body.token || req.query.token || req.headers['x-access-token'];
-  if (token) {
-    if (token = config.secret) {
-      var found = false;
-      db.all('SELECT * FROM users WHERE mac="' + req.params.mac + '"', function(err, rows) {
-        if (rows.length > 0) {
-          res.send(rows[0].name);
-        } else {
-          res.send(false);
-        }
-      });
-    } else { 
-      res.status(403).send({
-        success: false,
-        message: 'No token provided.'
-      });
-    }
-  } else {
-    res.status(403).send({
-        success: false,
-        message: 'No token provided.'
-    });
-  }
-});
+function sendAdminMessage(msg) {
+ marvin_utils.log(ADMIN_ID + " : " + msg);
+ if (ADMIN_ID) { 
+   sendMessageToUser(ADMIN_ID, msg);
+ }
+}
 
-app.get('/roommates', function (req, res) {
-  var token = req.body.token || req.query.token || req.headers['x-access-token'];
-  if (token) {
-    if (token = config.secret) {
-      db.all('SELECT * FROM users', function(err, rows) {
-        if (rows.length > 0) {
-          res.send(JSON.stringify(rows));
-        } else {
-          res.send(false);
-        }
-      });
-    } else {
-      res.status(403).send({
-        success: false,
-        message: 'No token provided.'
-      });
-    }
-  } else {
-    res.status(403).send({
-        success: false,
-        message: 'No token provided.'
-    });
+exports.toggleRoom = function toggle(user) {
+  var room = roomMap[user];
+  
+  db.all('SELECT * FROM rooms WHERE room_name LIKE "%' + room + '%"', function(err, rooms) {
+    marvin_utils.inspect(rooms);
+    rooms.forEach(function(room) {
+      var devices = room.device_ids.split('&');
+      for (var i=0;i<devices.length;i++) {
+        hue_controller_instance.toggleLight(devices[i]);
+      }   
+    })
+  })
+}
+
+exports.addRoom = function add(room_name, devices, beacons) {
+  addRoom(room_name, devices, beacons);
+}
+
+function addRoom(room_name, devices, beacons) {
+  var stmt = db.prepare('INSERT OR REPLACE INTO rooms VALUES (?, ?, ?)');
+
+  var deviceEntry = "";
+  for (var i=0;i<devices.length;i++) {
+    marvin_utils.inspect(devices[i]);
+    deviceEntry = deviceEntry + "&" + devices[i].id;
   }
 
-
-});
-
-app.post('/heartbeat', function (req, res) {
-  var token = req.body.token || req.query.token || req.headers['x-access-token'];
-  if (token) {
-    if (token = config.secret) {
-      if (req.body.name != null &&
-          req.body.mac != null &&
-          req.body.status != null &&
-          req.body.room != null &&
-          req.body.gcm != null) {
-        addItem(req.body.name, req.body.mac, req.body.status, req.body.room, req.body.gcm);
-        res.sendStatus(200);
-      } else {
-        res.send(400);
-      }
-    } else {
-      res.status(403).send({
-        success: false,
-        message: 'No token provided.'
-      });
-    }
-  } else {
-    res.status(403).send({
-        success: false,
-        message: 'No token provided.'
-    });
+  var beaconEntry = "";
+  for (var i=0;i<beacons.length;i++) {
+    marvin_utils.inspect(beacons[i]);
+    beaconEntry = beaconEntry + "&" + beacons[i].mac + "|" + beacons[i].uuid;
   }
-});
 
-app.post('/register', function (req, res) {
-  var token = req.body.token || req.query.token || req.headers['x-access-token'];
-  if (token) {
-    if (token = config.secret) {
-      addItem(req.body.name, req.body.mac, "", "", req.body.gcm);
-      res.sendStatus(200);
-    } else {
-      res.status(403).send({
-        success: false,
-        message: 'No token provided.'
-      });
-    }
-  } else {
-    res.status(403).send({
-        success: false,
-        message: 'No token provided.'
-    });
-  }
-});
-
-function addItem(name, mac, status, room, gcm) {
-  log("new data : [" + name + " : " + mac + " : " + status + " : " + room + " : " + gcm + "]");
-  var stmt = db.prepare('INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?, ?)');
-  stmt.run(name, mac, status, room, new Date().getTime(), gcm);
+  stmt.run(room_name, beaconEntry, deviceEntry);
   stmt.finalize();
 }
 
-var server = app.listen(3000, function () {
-  var host = server.address().address;
-  var port = server.address().port;
-
-  log(util.format('App listening at %s:%s', host, port));
-});
-
-setInterval(function() {
-  dumpData();
-
-  for (var i in failedCalls) {
-    setLightState(i, failedCalls[i])
-  }
-
-  failedCalls = {};
-
-}, EXIT_GRACE_PERIOD / 2);
-
-function log(data) {
-  var timeStamp = moment(moment()).tz('America/New_York').format('MMMM Do YYYY, h:mm:ss a');
-  console.log(timeStamp + " - " + data);
-  fs.appendFile('/var/log/bluetooth_server.log', timeStamp + " - " +  data + "\n", null);
+exports.addItem = function add(profile_id, name, email, status, room, gcm) {
+  addItem(profile_id, name, email, status, room, gcm);
 }
 
-require('shutdown-handler').on('exit', function(e) {
-  e.preventDefault();
-});
+function handleUserChangedRooms(oldRoom, room) {
+  marvin_utils.inspect(room);
+  marvin_utils.inspect(oldRoom);
+  db.all('SELECT * FROM users WHERE room="' + oldRoom + '"', function(err, usersInRoom) {
+    if (usersInRoom.length == 1) {
+      setRoomToState(oldRoom, hue_controller_instance.offState());
+    }
+  });
 
-function inspect(data) {
-  log(util.inspect(data, { showHidden: true, depth: null }))
-}
-
-function requestHeartBeatForUser(mac) {
-  var message = new gcm.Message();
-  message.addData('action', 'request_beat');
-        
-  var ids = [];
-
-  db.all('SELECT * FROM users WHERE mac="' + mac + '"', function(err, usersAll) {
-    log(mac + " : length " + usersAll.length);
-    usersAll.forEach(function(user) {
-      log(user.name + " : id = "  + user.gcm_id);
-      ids.push(user.gcm_id);
-    });
-
-    sender.send(message, { registrationIds: ids });
+  db.all('SELECT * FROM users WHERE room="' + room + '"', function(err, usersInRoom) {
+    if (usersInRoom.length == 0) {
+      setRoomToState(room, hue_controller_instance.onState());
+    }
   });
 }
 
-function sendMessageToUser(mac, messageData) {
-  var message = new gcm.Message();
-  message.addData('action', 'message');
-  message.addData('message_content', messageData);
+function setRoomToState(room, state) {
+  db.all('SELECT * FROM rooms WHERE room_name LIKE "%' + room + '%"', function(err, rooms) {
+    marvin_utils.log('handling room : ' + room);
+    marvin_utils.inspect(rooms);
+    rooms.forEach(function(room) {
+      var devices = room.device_ids.split('&');
+      for (var i=0;i<devices.length;i++) {
+        hue_controller_instance.setLightState(devices[i], state);
+      }
+    })
+  })
+}
 
-  var ids = [];  message.addData('action', 'message');
+function addItem(profile_id, name, email, status, room, gcm) {
+  var oldRoom = roomMap[name];
+  roomMap[name] = room;
+  if (oldRoom !== room) {
+    marvin_utils.log(name + " from " + oldRoom + " to " + room);
+    handleUserChangedRooms(oldRoom, room);
+  }
+  
+  marvin_utils.log("new data : [" + name + " : " + email + " : " + status + " : " + room + "]");
+  var stmt = db.prepare('INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?, ?, ?)');
+  stmt.run(profile_id, name, email, status, room, new Date().getTime(), gcm);
+  stmt.finalize();
+}
 
-  db.all('SELECT * FROM users WHERE mac="' + mac + '"', function(err, usersAll) {
+setInterval(function() {
+  dumpData();
+}, 5000);
+
+function requestHeartBeatForUser(profile_id) {
+  var ids = [];
+
+  db.all('SELECT * FROM users WHERE profile_id="' + profile_id + '"', function(err, usersAll) {
+    if (err) {
+      marvin_utils.log(err);
+    }
+    marvin_utils.log(profile_id + " : length " + usersAll.length);
     usersAll.forEach(function(user) {
-      log(user.name + " : id = "  + user.gcm_id);
+      marvin_utils.log(user.name + " : id = "  + user.gcm_id);
       ids.push(user.gcm_id);
     });
 
-    sender.send(message, { registrationIds: ids });
+    gcm_controller.requestBeat({ registrationIds: ids });
+  });
+}
+
+function sendMessageToUser(profile_id, messageData) {
+  var ids = [];
+  db.all('SELECT * FROM users WHERE profile_id="' + profile_id + '"', function(err, usersAll) {
+    usersAll.forEach(function(user) {
+      marvin_utils.log(user.name + " : id = "  + user.gcm_id);
+      ids.push(user.gcm_id);
+    });
+
+    gcm_controller.sendMessage(messageData, { registrationIds: ids });
   });
 }
 
 function sendMessageToAllUsers(messageData) {
-  var message = new gcm.Message();
-  message.addData('action', 'message');
-  message.addData('message_content', messageData);
-
-  var ids = [];  message.addData('action', 'message');
-
+  var ids = [];
   db.all('SELECT * FROM users', function(err, usersAll) {
     usersAll.forEach(function(user) {
-      log(user.name + " : id = "  + user.gcm_id);
+      marvin_utils.log(user.name + " : id = "  + user.gcm_id);
       ids.push(user.gcm_id);
     });
 
-    sender.send(message, { registrationIds: ids });
+    gcm_controller.sendMessage(messageData, { registrationIds: ids });
   });
 }
 
-function send_lines(filename, line_count, res) {
-    var data = fs.readFileSync(filename, 'utf8');
-    var lines = data.split("\n");
-
-    var result = '';
-    for (var i=line_count; i>=0; i--) {
-      result = result + "\n" + lines[(lines.length - i)];
+function startWatch() {
+  watch.watchTree('/Library/Server/Web/Data/Sites/marvin.boldlygoingnowhere.org/marvin_android/', function (f, curr, prev) {
+    if (typeof f == "object" && prev === null && curr === null) {
+    } else if (prev === null) {
+      var split = f.split("/");
+      var l = split.length;
+      sendUpdateMessage(split[l-3] + "/" + split[l-2] + "/"+ split[l-1]) ;
     }
-   res.send(result);
+  })
+}
+
+function sendUpdateMessage(messageData) {
+  var ids = [];
+
+  db.all('SELECT * FROM users', function(err, usersAll) {
+    usersAll.forEach(function(user) {
+      marvin_utils.log("alerting " +user.name + " : id = "  + user.gcm_id + " to update at " + messageData);
+      ids.push(user.gcm_id);
+    });
+
+    gcm_controller.sendUpdate(messageData, { registrationIds: ids });
+  });
 }

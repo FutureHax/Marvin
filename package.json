@@ -16,10 +16,12 @@
     "jsonwebtoken": "^5.4.0",
     "moment": "^2.10.6",
     "moment-timezone": "^0.4.1",
+    "multer": "^1.1.0",
     "node-gcm": "^0.12.0",
     "node-hue-api": "^1.2.1",
     "shutdown-handler": "^1.0.1",
-    "sqlite3": "3.0.5",
-    "unofficial-nest-api": "^0.1.4"
+    "sqlite3": "^3.1.0",
+    "unofficial-nest-api": "^0.1.4",
+    "watch": "^0.16.0"
   }
 }

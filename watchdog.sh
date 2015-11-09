@@ -21,9 +21,9 @@ if pid_file_exists
             echo "Node app running with pid $PID"
         else
             echo "Node app stopped, but pid file exists"
-            service bluetooth_server restart --force
+            pushd /var/www/bluetooth_server/ ; ./startup.sh start --force ; popd
         fi
     else
         echo "Node app stopped"
-        service bluetooth_server start
+        pushd /var/www/bluetooth_server/ ; ./startup.sh start ; popd
     fi

@@ -46,6 +46,7 @@ Support
 
 If you've found an error in the node server or the Android application, please file an issue:
 https://github.com/FutureHax/Marvin/issues
+
 https://github.com/FutureHax/Marvin_Android/issues
 
 Patches are encouraged, and may be submitted by forking this project and
@@ -53,7 +54,7 @@ submitting a pull request through GitHub.
 
 License
 -------
-
+```
                     GNU GENERAL PUBLIC LICENSE
                        Version 2, June 1991
 
@@ -393,3 +394,4 @@ proprietary programs.  If your program is a subroutine library, you may
 consider it more useful to permit linking proprietary applications with the
 library.  If this is what you want to do, use the GNU Lesser General
 Public License instead of this License.
+```

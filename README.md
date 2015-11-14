@@ -47,7 +47,7 @@ Support
 If you've found an error in the node server or the Android application, please file an issue:
 https://github.com/FutureHax/Marvin/issues
 
-https://github.com/FutureHax/Marvin_Android/issues
+https://github.com/FutureHax/Marvin-Android/issues
 
 Patches are encouraged, and may be submitted by forking this project and
 submitting a pull request through GitHub.

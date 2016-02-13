@@ -22,6 +22,9 @@ var gcm_controller = require('./gcm_controller.js');
 var express_controller = require('./express_controller.js');
 
 var nest_controller = require('./nest_controller.js');
+var my_q_controller = require('./my_q_controller.js');
+
+var passport = require('passport-google-id-token');
 
 var awayCount = 0;
 
@@ -43,14 +46,17 @@ bleno.on('advertisingStart', function(error) {
 
 db.serialize(function() {
  //clear rooms
- //db.run('DROP TABLE IF EXISTS rooms');
+// db.run('DROP TABLE IF EXISTS users');
 
  sendAdminMessage('Marvin is waking up');
- db.run('CREATE TABLE IF NOT EXISTS users (profile_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL, email TEXT NOT NULL, status TEXT NOT NULL, room TEXT NOT NULL, lastBeat NUMBER, gcm_id TEXT NOT NULL)');
+ db.run('CREATE TABLE IF NOT EXISTS users (profile_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL, email TEXT NOT NULL, status TEXT NOT NULL, room TEXT NOT NULL, lastBeat NUMBER, gcm_id TEXT NOT NULL, enable_tracking NUMBER NOT NULL)');
  db.run('CREATE TABLE IF NOT EXISTS devices (id TEXT NOT NULL UNIQUE, name TEXT NOT NULL, type TEXT NOT NULL)');
  db.run('CREATE TABLE IF NOT EXISTS rooms (room_name TEXT NOT NULL UNIQUE, mac_list TEXT NOT NULL, device_ids TEXT NOT NULL)');
 
+ my_q_controller.setupNightlyClosure();
  nest_controller.logIn();
+    nest_controller.setAway(false);
+
  hue_controller_instance = new hue_controller(db);
  express_controller_instance = new express_controller(db, hue_controller_instance);
  startWatch();
@@ -74,7 +80,7 @@ function handleSomebodyHome(structure) {
     sendMessageToAllUsers("Setting " + structure.name + " to home");
     marvin_utils.log("Setting " + structure.name + " to home");
     nest_controller.setAway(false);
-    hue_controller_instance.allOn();
+    hue_controller_instance.allOnForHome();
   }
 }
 
@@ -85,6 +91,7 @@ function handleNobodyHome(structure) {
       marvin_utils.log("Setting " + structure.name + " to away");
       nest_controller.setAway(true);
       hue_controller_instance.allOff();
+      my_q_controller.closeDoor();
     } else {
       awayCount++;
       marvin_utils.log("Away for " + awayCount + " cycles.")
@@ -117,13 +124,11 @@ function dumpData() {
                   sendMessageToAllUsers("Setting " + structure.name + " to home");
 		  marvin_utils.log("Setting " + structure.name + " to home");
                   nest_controller.setAway(false);
-	          hue_controller_instance.allOn();
                 }
               }
             }
             usersAll.forEach(function (user) {
               var time = now - user.lastBeat;
-              marvin_utils.log("Checking  " + user.name + " = " + time);
               if (time > 1000 * 60 * 15) {
                 marvin_utils.log("Requesting heartbeat from " + user.name);
                 requestHeartBeatForUser(user.profile_id);
@@ -155,7 +160,9 @@ exports.toggleRoom = function toggle(user) {
     rooms.forEach(function(room) {
       var devices = room.device_ids.split('&');
       for (var i=0;i<devices.length;i++) {
-        hue_controller_instance.toggleLight(devices[i]);
+ 	if (devices[i]) {
+          hue_controller_instance.toggleLight(devices[i]);
+        }
       }   
     })
   })
@@ -184,8 +191,8 @@ function addRoom(room_name, devices, beacons) {
   stmt.finalize();
 }
 
-exports.addItem = function add(profile_id, name, email, status, room, gcm) {
-  addItem(profile_id, name, email, status, room, gcm);
+exports.addItem = function add(profile_id, name, email, status, room, gcm, enable_tracking) {
+  addItem(profile_id, name, email, status, room, gcm, enable_tracking);
 }
 
 function handleUserChangedRooms(oldRoom, room) {
@@ -206,7 +213,6 @@ function handleUserChangedRooms(oldRoom, room) {
 
 function setRoomToState(room, state) {
   db.all('SELECT * FROM rooms WHERE room_name LIKE "%' + room + '%"', function(err, rooms) {
-    marvin_utils.log('handling room : ' + room);
     marvin_utils.inspect(rooms);
     rooms.forEach(function(room) {
       var devices = room.device_ids.split('&');
@@ -217,17 +223,16 @@ function setRoomToState(room, state) {
   })
 }
 
-function addItem(profile_id, name, email, status, room, gcm) {
+function addItem(profile_id, name, email, status, room, gcm, enable_tracking) {
   var oldRoom = roomMap[name];
   roomMap[name] = room;
-  if (oldRoom !== room) {
+  if (oldRoom !== room && enable_tracking == 1) {
     marvin_utils.log(name + " from " + oldRoom + " to " + room);
     handleUserChangedRooms(oldRoom, room);
   }
   
-  marvin_utils.log("new data : [" + name + " : " + email + " : " + status + " : " + room + "]");
-  var stmt = db.prepare('INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?, ?, ?)');
-  stmt.run(profile_id, name, email, status, room, new Date().getTime(), gcm);
+  var stmt = db.prepare('INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+  stmt.run(profile_id, name, email, status, room, new Date().getTime(), gcm, enable_tracking);
   stmt.finalize();
 }
 
@@ -242,9 +247,7 @@ function requestHeartBeatForUser(profile_id) {
     if (err) {
       marvin_utils.log(err);
     }
-    marvin_utils.log(profile_id + " : length " + usersAll.length);
     usersAll.forEach(function(user) {
-      marvin_utils.log(user.name + " : id = "  + user.gcm_id);
       ids.push(user.gcm_id);
     });
 
@@ -255,12 +258,13 @@ function requestHeartBeatForUser(profile_id) {
 function sendMessageToUser(profile_id, messageData) {
   var ids = [];
   db.all('SELECT * FROM users WHERE profile_id="' + profile_id + '"', function(err, usersAll) {
-    usersAll.forEach(function(user) {
-      marvin_utils.log(user.name + " : id = "  + user.gcm_id);
-      ids.push(user.gcm_id);
-    });
+    if (usersAll) {
+      usersAll.forEach(function(user) {
+        ids.push(user.gcm_id);
+      });
 
-    gcm_controller.sendMessage(messageData, { registrationIds: ids });
+      gcm_controller.sendMessage(messageData, { registrationIds: ids });
+    }
   });
 }
 
@@ -268,7 +272,6 @@ function sendMessageToAllUsers(messageData) {
   var ids = [];
   db.all('SELECT * FROM users', function(err, usersAll) {
     usersAll.forEach(function(user) {
-      marvin_utils.log(user.name + " : id = "  + user.gcm_id);
       ids.push(user.gcm_id);
     });
 

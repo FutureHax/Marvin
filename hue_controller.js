@@ -5,7 +5,7 @@ var hue = require("node-hue-api"),
     HueApi = hue.HueApi,
     lightState = hue.lightState;
 
-var host = "192.168.1.136",
+var host = config.hue_ip,
     username = config.hue_user,
     api = new HueApi(host, username);
 
@@ -32,7 +32,11 @@ Controller.prototype.lightsArray = function() {
   return lightsArray;
 }
 
-var allOn = function() {
+Controller.prototype.allOnForHome = function() {
+  allOnForHome();
+}
+
+var allOnForHome = function() {
   for (var i in lightsArray) {
     if (lightsArray[i].name
         .indexOf('Living') > -1 ||
@@ -41,7 +45,6 @@ var allOn = function() {
       setLightState(lightsArray[i].id, onState);
     }
   }
-  return "on";
 }
 
 Controller.prototype.allOff = function allOff() {
